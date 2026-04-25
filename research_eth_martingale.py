@@ -92,7 +92,8 @@ def chunked_funding_fetch(symbol: str, start_ms: int, end_ms: int) -> List[Dict[
 
 
 def chunked_open_interest_fetch(symbol: str, start_ms: int, end_ms: int) -> List[Dict[str, object]]:
-    cursor = start_ms
+    latest_available_start = end_ms - 29 * MS_IN_DAY
+    cursor = max(start_ms, latest_available_start)
     rows: List[Dict[str, object]] = []
     while cursor < end_ms:
         batch = http_get_json(
@@ -616,7 +617,8 @@ def backtest(
     fee_rate: float,
     slippage_rate: float,
 ) -> Dict[str, object]:
-    regimes = classify_regimes(features, params["trend_entry_threshold"], params["trend_exit_threshold"])
+    signal_state = classify_regimes(features, params)
+    regimes = signal_state["regime"]
     close_price = hourly["close"]
     high_price = hourly["high"]
     low_price = hourly["low"]
@@ -637,41 +639,48 @@ def backtest(
     entry_index = start_index
     max_adverse = 0.0
     liquidation_events = 0
+    partial_taken = False
+    position_peak_return = 0.0
+    trade_realized_pnl = 0.0
     regime_counts = {"up": 0, "down": 0, "range": 0, "unstable": 0}
 
     def compute_add_step(index: int, direction: int) -> float:
         step_type = params["add_step_type"]
         if step_type == "fixed_pct":
             return params["add_step_long"] if direction > 0 else params["add_step_short"]
-        if step_type == "atr_multiple":
-            atr_pct = atr_values[index] / close_price[index] if close_price[index] else 0.0
-            multiple = params["add_step_long"] if direction > 0 else params["add_step_short"]
-            return atr_pct * multiple
         atr_pct = atr_values[index] / close_price[index] if close_price[index] else 0.0
-        realized_vol = features["std_1h"][index] if not math.isnan(features["std_1h"][index]) else 0.0
-        return max(0.008, min(0.025, 0.7 * atr_pct + 2.0 * realized_vol))
+        multiple = params["add_step_long"] if direction > 0 else params["add_step_short"]
+        return atr_pct * multiple
 
-    def close_position(index: int, reason: str) -> None:
-        nonlocal equity, position_direction, avg_entry, total_size, current_layers, next_add_price, cooldown_until, max_adverse, entry_index, liquidation_events
+    def realize_position(index: int, size_fraction: float, final_exit: bool) -> None:
+        nonlocal equity, position_direction, avg_entry, total_size, current_layers, next_add_price, cooldown_until, max_adverse, entry_index, liquidation_events, partial_taken, position_peak_return, trade_realized_pnl
         if position_direction == 0 or total_size <= 0:
+            return
+        realized_size = total_size * min(1.0, max(0.0, size_fraction))
+        if realized_size <= 0:
             return
         exit_price = close_price[index] * (1 - slippage_rate * position_direction)
         gross_return = position_direction * (exit_price - avg_entry) / avg_entry
         funding_cost = np.sum(funding_hourly[entry_index : index + 1]) * position_direction * -1
-        cost = 2 * fee_rate * total_size + slippage_rate * 2 * total_size
-        effective_exposure = total_size * leverage
+        cost = 2 * fee_rate * realized_size + slippage_rate * 2 * realized_size
+        effective_exposure = realized_size * leverage
         pnl = gross_return * effective_exposure - cost + funding_cost * effective_exposure
         equity *= 1 + pnl
+        trade_realized_pnl += pnl
         if equity <= 0:
             liquidation_events += 1
             equity = 1e-6
+        total_size -= realized_size
+        if total_size > 1e-9 and not final_exit:
+            partial_taken = True
+            return
         trade_regime = int(regimes[entry_index]) if entry_index < len(regimes) else 0
         trades.append(
             Trade(
                 direction=position_direction,
                 entry_time=int(time_array[entry_index]),
                 exit_time=int(time_array[index]),
-                pnl=float(pnl),
+                pnl=float(trade_realized_pnl),
                 holding_hours=float(index - entry_index + 1),
                 regime=trade_regime,
                 layers=current_layers,
@@ -684,6 +693,9 @@ def backtest(
         current_layers = 0
         next_add_price = 0.0
         max_adverse = 0.0
+        partial_taken = False
+        position_peak_return = 0.0
+        trade_realized_pnl = 0.0
         cooldown_until = index + int(params["cooldown_bars"])
 
     for index in range(start_index, end_index):
@@ -698,18 +710,28 @@ def backtest(
             regime_counts["unstable"] += 1
 
         if position_direction != 0:
+            price_edge = position_direction * (close_price[index] - avg_entry) / avg_entry
             effective_exposure = total_size * leverage
-            unrealized = position_direction * (close_price[index] - avg_entry) / avg_entry * effective_exposure
+            unrealized = price_edge * effective_exposure
             max_adverse = min(max_adverse, unrealized)
+            position_peak_return = max(position_peak_return, price_edge)
+            partial_take_profit_pct = float(params["partial_take_profit_pct_long"] if position_direction > 0 else params["partial_take_profit_pct_short"])
+            partial_take_profit_share = float(params["partial_take_profit_share_long"] if position_direction > 0 else params["partial_take_profit_share_short"])
+            trailing_activation_pct = float(params["trailing_activation_pct_long"] if position_direction > 0 else params["trailing_activation_pct_short"])
+            trailing_stop_gap = float(params["trailing_stop_gap_long"] if position_direction > 0 else params["trailing_stop_gap_short"])
+            stop_loss_pct = float(params["stop_loss_pct_long"] if position_direction > 0 else params["stop_loss_pct_short"])
+
+            if not partial_taken and price_edge >= partial_take_profit_pct:
+                realize_position(index, partial_take_profit_share, False)
             if unrealized <= -float(params["max_loss_per_cycle"]):
-                close_position(index, "max_loss")
-            elif unrealized <= -float(params["stop_loss_pct"]):
-                close_position(index, "stop")
-            elif unrealized >= float(params["take_profit_pct"]):
-                close_position(index, "take_profit")
-            elif bool(params["exit_on_reversal"]) and ((position_direction > 0 and regime <= 0) or (position_direction < 0 and regime >= 0)):
-                close_position(index, "reversal")
-            elif position_direction > 0 and current_layers < int(params["max_layers_long"]) and low_price[index] <= next_add_price:
+                realize_position(index, 1.0, True)
+            elif unrealized <= -stop_loss_pct:
+                realize_position(index, 1.0, True)
+            elif position_peak_return >= trailing_activation_pct and price_edge <= position_peak_return - trailing_stop_gap and price_edge > 0:
+                realize_position(index, 1.0, True)
+            elif bool(params["exit_on_reversal"]) and ((position_direction > 0 and signal_state["long_hold"][index] == 0) or (position_direction < 0 and signal_state["short_hold"][index] == 0)):
+                realize_position(index, 1.0, True)
+            elif not partial_taken and position_direction > 0 and current_layers < int(params["max_layers_long"]) and low_price[index] <= next_add_price:
                 add_size = float(params["base_size_long"]) * (float(params["multiplier_long"]) ** current_layers)
                 projected_size = total_size + add_size
                 if projected_size <= float(params["max_position_pct"]):
@@ -717,7 +739,7 @@ def backtest(
                     total_size = projected_size
                     current_layers += 1
                     next_add_price = avg_entry * (1 - compute_add_step(index, 1))
-            elif position_direction < 0 and current_layers < int(params["max_layers_short"]) and high_price[index] >= next_add_price:
+            elif not partial_taken and position_direction < 0 and current_layers < int(params["max_layers_short"]) and high_price[index] >= next_add_price:
                 add_size = float(params["base_size_short"]) * (float(params["multiplier_short"]) ** current_layers)
                 projected_size = total_size + add_size
                 if projected_size <= float(params["max_position_pct"]):
@@ -727,19 +749,25 @@ def backtest(
                     next_add_price = avg_entry * (1 + compute_add_step(index, -1))
 
         if position_direction == 0 and index >= cooldown_until:
-            if regime == 1:
+            if signal_state["long_entry"][index] == 1:
                 total_size = float(params["base_size_long"])
                 avg_entry = close_price[index] * (1 + slippage_rate)
                 position_direction = 1
                 current_layers = 1
                 entry_index = index
+                partial_taken = False
+                position_peak_return = 0.0
+                trade_realized_pnl = 0.0
                 next_add_price = avg_entry * (1 - compute_add_step(index, 1))
-            elif regime == -1:
+            elif signal_state["short_entry"][index] == 1:
                 total_size = float(params["base_size_short"])
                 avg_entry = close_price[index] * (1 - slippage_rate)
                 position_direction = -1
                 current_layers = 1
                 entry_index = index
+                partial_taken = False
+                position_peak_return = 0.0
+                trade_realized_pnl = 0.0
                 next_add_price = avg_entry * (1 + compute_add_step(index, -1))
 
         equity_curve.append(equity if position_direction == 0 else equity * (1 + position_direction * total_size * leverage * (close_price[index] - avg_entry) / avg_entry))
@@ -751,7 +779,7 @@ def backtest(
                 liquidation_events += 1
 
     if position_direction != 0:
-        close_position(end_index - 1, "end")
+        realize_position(end_index - 1, 1.0, True)
 
     equity_array = np.array(equity_curve, dtype=np.float64)
     peaks = np.maximum.accumulate(equity_array)
@@ -840,21 +868,10 @@ def walk_forward_search(hourly: Dict[str, np.ndarray], features: Dict[str, np.nd
             continue
         if train_result["worst_trade"] < -0.2 or validation_result["worst_trade"] < -0.2:
             continue
-        combined_score = (
-            0.5 * validation_result["objective"]
-            + 0.35 * train_result["objective"]
-            + 0.15 * validation_result["monthly_avg_return"]
-            - 0.45 * stability_gap
-        )
-        candidates.append(
-            {
-                "params": params,
-                "train": train_result,
-                "validation": validation_result,
-                "combined_score": combined_score,
-                "stability_gap": stability_gap,
-            }
-        )
+        if validation_result["monthly_avg_return"] < 0.01:
+            continue
+        combined_score = 0.5 * validation_result["objective"] + 0.35 * train_result["objective"] + 0.15 * validation_result["monthly_avg_return"] - 0.45 * stability_gap
+        candidates.append({"params": params, "train": train_result, "validation": validation_result, "combined_score": combined_score, "stability_gap": stability_gap})
     if not candidates:
         raise RuntimeError("No parameter candidates survived safety filters")
     candidates.sort(key=lambda item: item["combined_score"], reverse=True)
@@ -863,36 +880,31 @@ def walk_forward_search(hourly: Dict[str, np.ndarray], features: Dict[str, np.nd
     for candidate in top_candidates:
         test_result = backtest(hourly, features, candidate["params"], validation_end, size, fee_rate, slippage_rate)
         test_results.append({**candidate, "test": test_result})
-    test_results.sort(
-        key=lambda item: item["test"]["objective"] + 0.25 * item["test"]["monthly_avg_return"] - 0.55 * item["stability_gap"],
-        reverse=True,
-    )
+    test_results.sort(key=lambda item: item["test"]["objective"] + 0.25 * item["test"]["monthly_avg_return"] - 0.55 * item["stability_gap"], reverse=True)
     best = test_results[0]
     full_year_result = backtest(hourly, features, best["params"], 120, size, fee_rate, slippage_rate)
-    return {
-        "searched_candidates": len(params_list),
-        "survivors": len(candidates),
-        "search_ranges": search_ranges,
-        "best": best,
-        "full_year": full_year_result,
-        "train_end": train_end,
-        "validation_end": validation_end,
-        "top_candidates": test_results,
-    }
+    return {"searched_candidates": len(params_list), "survivors": len(candidates), "search_ranges": search_ranges, "best": best, "full_year": full_year_result, "train_end": train_end, "validation_end": validation_end, "top_candidates": test_results}
 
 
 def current_regime_summary(hourly: Dict[str, np.ndarray], features: Dict[str, np.ndarray], params: Dict[str, object]) -> Dict[str, object]:
-    regimes = classify_regimes(features, params["trend_entry_threshold"], params["trend_exit_threshold"])
+    signals = classify_regimes(features, params)
+    regimes = signals["regime"]
     last_index = len(regimes) - 1
     regime_map = {1: "Uptrend", -1: "Downtrend", 0: "Range", 3: "HighVolatilityUnstable", 2: "Range"}
     current = regime_map.get(int(regimes[last_index]), "Range")
     conclusion = {
         "current_regime": current,
-        "trend_score": float(features["trend_score"][last_index]),
+        "long_score": float(features["long_score"][last_index]),
+        "short_score": float(features["short_score"][last_index]),
         "adx_1h": float(features["adx_1h"][last_index]),
         "ema_stack_up": bool(features["ema_stack_up"][last_index]),
         "ema_stack_down": bool(features["ema_stack_down"][last_index]),
         "volatility_flag": bool(features["is_high_vol"][last_index]),
+        "funding_hourly": float(features["funding_hourly"][last_index]),
+        "oi_change_ema": float(features["oi_change_ema"][last_index]),
+        "activity_spike": float(features["activity_spike"][last_index]),
+        "long_entry_ready": bool(signals["long_entry"][last_index]),
+        "short_entry_ready": bool(signals["short_entry"][last_index]),
         "time": ms_to_iso(int(hourly["time"][last_index])),
     }
     bars_4h = aggregate_bars(hourly, 4)
@@ -915,8 +927,10 @@ def build_final_json(config: ResearchConfig, params: Dict[str, object], risk_fla
         "market_type": config.market_type,
         "mode": "research_only",
         "timeframes": ["1h", "4h", "1d"],
-        "trend_entry_threshold": params["trend_entry_threshold"],
-        "trend_exit_threshold": params["trend_exit_threshold"],
+        "trend_entry_threshold_long": params["trend_entry_threshold_long"],
+        "trend_entry_threshold_short": params["trend_entry_threshold_short"],
+        "trend_exit_threshold_long": params["trend_exit_threshold_long"],
+        "trend_exit_threshold_short": params["trend_exit_threshold_short"],
         "base_size_long": params["base_size_long"],
         "base_size_short": params["base_size_short"],
         "multiplier_long": params["multiplier_long"],
@@ -926,8 +940,20 @@ def build_final_json(config: ResearchConfig, params: Dict[str, object], risk_fla
         "add_step_long": params["add_step_long"],
         "add_step_short": params["add_step_short"],
         "add_step_type": params["add_step_type"],
-        "stop_loss_pct": params["stop_loss_pct"],
-        "take_profit_pct": params["take_profit_pct"],
+        "stop_loss_pct_long": params["stop_loss_pct_long"],
+        "stop_loss_pct_short": params["stop_loss_pct_short"],
+        "partial_take_profit_pct_long": params["partial_take_profit_pct_long"],
+        "partial_take_profit_pct_short": params["partial_take_profit_pct_short"],
+        "partial_take_profit_share_long": params["partial_take_profit_share_long"],
+        "partial_take_profit_share_short": params["partial_take_profit_share_short"],
+        "trailing_activation_pct_long": params["trailing_activation_pct_long"],
+        "trailing_activation_pct_short": params["trailing_activation_pct_short"],
+        "trailing_stop_gap_long": params["trailing_stop_gap_long"],
+        "trailing_stop_gap_short": params["trailing_stop_gap_short"],
+        "funding_extreme_abs_max_long": params["funding_extreme_abs_max_long"],
+        "funding_extreme_abs_max_short": params["funding_extreme_abs_max_short"],
+        "oi_change_min_long": params["oi_change_min_long"],
+        "oi_change_min_short": params["oi_change_min_short"],
         "max_position_pct": params["max_position_pct"],
         "cooldown_bars": params["cooldown_bars"],
         "max_loss_per_cycle": params["max_loss_per_cycle"],
@@ -993,12 +1019,12 @@ def main() -> int:
     if len(hourly_rows) < 1000:
         raise RuntimeError("Insufficient hourly bars fetched from Binance")
     funding_rows = chunked_funding_fetch(config.symbol, config.start_ms, config.end_ms)
+    open_interest_rows = chunked_open_interest_fetch(config.symbol, config.start_ms, config.end_ms)
     hourly = rows_to_arrays(hourly_rows)
     data_quality = validate_data(hourly, MS_IN_HOUR)
-    features = build_features(hourly, funding_rows)
+    features = build_features(hourly, funding_rows, open_interest_rows)
     search = walk_forward_search(hourly, features, config.fee_rate, config.slippage_rate)
     best_params = dict(search["best"]["params"])
-    best_params["leverage"] = args.leverage
     full_year_indices = np.where((hourly["time"] >= full_year_start_ms) & (hourly["time"] <= end_ms))[0]
     if len(full_year_indices) < 500:
         raise RuntimeError("Insufficient bars for last-year evaluation window")
@@ -1019,6 +1045,8 @@ def main() -> int:
         risk_flags.append("max_drawdown_above_20pct")
     if full_year_result["liquidation_risk"] > 0.03:
         risk_flags.append("non_trivial_liquidation_risk")
+    if full_year_result["worst_trade"] < -0.2:
+        risk_flags.append("single_trade_loss_above_20pct")
     if full_year_result["profit_factor"] < 1.15:
         risk_flags.append("weak_profit_factor")
     if full_year_result["trade_count"] < 20:
@@ -1047,8 +1075,8 @@ def main() -> int:
         },
         "market_regime": current_regime,
         "strategy_branches": {
-            "Uptrend": "Long-only layered pullback entries; exit on reversal, stop-loss, or profit target.",
-            "Downtrend": "Short-only layered rebound entries; exit on reversal, stop-loss, or profit target.",
+            "Uptrend": "Long-only layered pullback entries with funding, open-interest, and activity filters; scale out partially, then trail the remainder.",
+            "Downtrend": "Short-only layered rebound entries with funding, open-interest, and activity filters; scale out partially, then trail the remainder.",
             "Range": "Martingale disabled by default.",
             "HighVolatilityUnstable": "Strategy disabled or risk reduced to zero in this research configuration.",
         },
